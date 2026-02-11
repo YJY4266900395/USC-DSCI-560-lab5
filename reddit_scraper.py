@@ -1,529 +1,407 @@
-import requests
+import argparse
+import hashlib
 import json
+import os
+import random
+import re
 import time
-import sys
 from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
-# ============ CONFIG ============
-SUBREDDITS = ["tech", "cybersecurity", "technology", "programming", "datascience", "computerscience"]
-SORT_METHODS = ["new", "hot", "top", "rising"]  # Bypass post limitation of .json endpoints by using different sort methods
-POSTS_PER_REQUEST = 100  # Reddit max per request
+import requests
 
-# Use a descriptive User-Agent (Reddit recommends this for .json endpoints)
-HEADERS = {
-    "User-Agent": "DSCI560-Lab5-Scraper/1.0 (Educational Project)"
-}
+# Defaults / Config
+UA_JSON = "DSCI560-Lab5-Scraper/2.0 (Educational Project; JSON endpoints; +your_email@example.com)"
+DEFAULT_SUBS = ["tech", "cybersecurity", "technology", "artificial", "datascience", "computerscience"]
+DEFAULT_SORTS = ["new", "hot", "top", "rising"]  # 多 sort 绕开单 listing ~1000 限制
+DEFAULT_GLOBAL_QUERY = "cyber OR security OR malware OR ransomware OR vulnerability"
 
-# Rate limiting config
-REQUEST_DELAY = 1.8      # seconds between requests (be polite)
-MAX_RETRIES = 4
-BACKOFF_FACTOR = 2        # exponential backoff multiplier
+POSTS_PER_REQUEST = 100  # reddit max
+MIN_TEXT_LEN = 30
 
-# Comment fetching config
-# COMMENT_SAMPLE_RATIO = 0.10   # keep top 10% of comments per post
-# COMMENT_MIN = 1               # at least 1 comment (if any exist)
-COMMENT_MAX = 500              # cap per post to avoid huge payloads
-COMMENT_SAVE_INTERVAL = 50    # save progress every N posts during comment fetch
-COMMENT_FETCH_THRESHOLD = 5   # skip getting comment for posts with comments fewer than this
-COMMENT_REQUEST_BUDGET = 500  # max number of comment requests to make total
-RATE_LIMIT_COOLDOWN = 120     # seconds to wait after hitting a 429 before resuming
+SLEEP_RANGE = (1.0, 2.0)
+MAX_RETRIES = 6
+BACKOFF_BASE = 2
 
 
-def fetch_json(url, params=None, retries=0):
-    """
-    Fetch a Reddit .json endpoint with exponential backoff on rate limits.
-    
-    The 'backoff' your teammate mentioned: when Reddit returns HTTP 429 
-    (Too Many Requests), we wait an exponentially increasing amount of time 
-    before retrying: 2s, 4s, 8s, 16s, 32s.
-    """
-    try:
-        response = requests.get(url, headers=HEADERS, params=params, timeout=30)
+# Utilities
+def clean_text(s: str) -> str:
+    """最小但够用的清洗：去HTML、零宽、合并空白、去奇怪控制符。"""
+    if not s:
+        return ""
+    s = s.replace("\u200b", " ")
+    # 去 HTML tag（JSON selftext 通常没tag，但保险）
+    s = re.sub(r"<[^>]+>", " ", s)
+    # 去一些控制字符
+    s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-        if response.status_code == 200:
-            return response.json()
 
-        elif response.status_code == 429:
-            if retries < MAX_RETRIES:
-                wait_time = BACKOFF_FACTOR ** (retries + 1)
-                print(f"  [429 Rate Limited] Waiting {wait_time}s before retry ({retries+1}/{MAX_RETRIES})...")
-                time.sleep(wait_time)
-                return fetch_json(url, params, retries + 1)
-            else:
-                print(f"  [ERROR] Max retries reached. Skipping.")
-                return None
+def mask_username(author: str, salt: str = "dsci560") -> str:
+    """把用户名 mask/pseudonymize。"""
+    if not author:
+        author = "unknown"
+    h = hashlib.sha256((salt + ":" + author).encode("utf-8")).hexdigest()
+    return "user_" + h[:12]
 
-        elif response.status_code >= 500:
-            if retries < MAX_RETRIES:
-                wait_time = BACKOFF_FACTOR ** (retries + 1)
-                print(f"  [Server Error {response.status_code}] Waiting {wait_time}s before retry...")
-                time.sleep(wait_time)
-                return fetch_json(url, params, retries + 1)
-            else:
-                print(f"  [ERROR] Max retries reached after server errors.")
-                return None
 
-        else:
-            print(f"  [ERROR] HTTP {response.status_code} for {url}")
-            return None
-
-    except requests.exceptions.Timeout:
-        if retries < MAX_RETRIES:
-            wait_time = BACKOFF_FACTOR ** (retries + 1)
-            print(f"  [Timeout] Waiting {wait_time}s before retry...")
-            time.sleep(wait_time)
-            return fetch_json(url, params, retries + 1)
+def to_iso_utc(ts_utc: Optional[float]) -> Optional[str]:
+    if not ts_utc:
         return None
-    except requests.exceptions.RequestException as e:
-        print(f"  [ERROR] Request exception: {e}")
-        return None
+    return datetime.fromtimestamp(ts_utc, tz=timezone.utc).isoformat()
 
 
-def parse_posts_from_json(json_data, subreddit):
+def is_likely_ad_or_irrelevant(post: Dict) -> bool:
+    # promoted / stickied 广告与置顶
+    if post.get("stickied"):
+        return True
+    if post.get("promoted"):
+        return True
+    # 有些广告/推荐会有 weird domain/empty author 等，这里不做过度猜测
+    return False
+
+
+def extract_image_fields(d: Dict) -> Tuple[bool, bool, str, List[str], str]:
     """
-    Parse posts from Reddit's JSON response.
-    
-    The JSON structure is:
-    {
-        "data": {
-            "children": [
-                {"data": { ...post fields... }},
-                ...
-            ],
-            "after": "t3_xxxxx"   <-- pagination token
-        }
-    }
+    返回:
+      is_image, is_gallery, image_url, gallery_urls, thumbnail
     """
-    posts = []
+    url = d.get("url") or ""
+    url_l = url.lower()
 
-    if not json_data or "data" not in json_data:
-        return posts, None
+    image_ext = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+    is_image = url_l.endswith(image_ext) or ("i.redd.it" in url_l) or ("v.redd.it" in url_l)
 
-    children = json_data["data"].get("children", [])
-    after_token = json_data["data"].get("after", None)
+    is_gallery = bool(d.get("is_gallery", False))
+    gallery_urls: List[str] = []
 
-    for child in children:
-        if child.get("kind") != "t3":  # t3 = link/post, skip others
-            continue
-
-        post = child["data"]
-
-        # Skip promoted/ad posts
-        if post.get("promoted") or post.get("is_reddit_media_domain") is None:
-            pass  # not all promoted posts have this flag, check stickied too
-        if post.get("stickied", False):
-            print(f"  [SKIP] Stickied post: {post.get('title', '')[:50]}")
-            continue
-
-        # Determine if this is an image post
-        url = post.get("url", "")
-        image_extensions = (".jpg", ".jpeg", ".png", ".gif", ".webp")
-        is_image = url.lower().endswith(image_extensions)
-
-        # Also check for Reddit-hosted images
-        if not is_image and "i.redd.it" in url:
+    if is_gallery and isinstance(d.get("media_metadata"), dict):
+        for _, info in d["media_metadata"].items():
+            if info.get("status") == "valid" and isinstance(info.get("s"), dict):
+                u = info["s"].get("u", "")
+                if u:
+                    gallery_urls.append(u.replace("&amp;", "&"))
+        if gallery_urls:
             is_image = True
 
-        # Check for gallery posts (multiple images)
-        is_gallery = post.get("is_gallery", False)
+    thumbnail = d.get("thumbnail") or ""
+    if thumbnail in ("self", "default", "nsfw", "spoiler"):
+        thumbnail = ""
 
-        # Extract gallery image URLs for multi-image posts.
-        # Gallery posts store image metadata in 'media_metadata' field.
-        gallery_urls = []
-        if is_gallery and "media_metadata" in post:
-            for media_id, media_info in post["media_metadata"].items():
-                if media_info.get("status") == "valid" and "s" in media_info:
-                    img_u = media_info["s"].get("u", "")
-                    if img_u:
-                        gallery_urls.append(img_u.replace("&amp;", "&"))
-            if gallery_urls:
-                is_image = True
-
-        # Get thumbnail URL
-        thumbnail = post.get("thumbnail", "")
-        if thumbnail in ("self", "default", "nsfw", "spoiler", ""):
-            thumbnail = ""
-
-        # Get image URL from preview if available
-        image_url = ""
-        if is_image:
-            image_url = url
-        elif "preview" in post and "images" in post["preview"]:
+    image_url = ""
+    if is_image:
+        image_url = url
+    else:
+        # preview 里有时也能拿到图
+        pv = d.get("preview", {})
+        if isinstance(pv, dict) and isinstance(pv.get("images"), list) and pv["images"]:
             try:
-                image_url = post["preview"]["images"][0]["source"]["url"]
-                # Reddit HTML-encodes the URL in preview
-                image_url = image_url.replace("&amp;", "&")
-            except (IndexError, KeyError):
+                image_url = pv["images"][0]["source"]["url"].replace("&amp;", "&")
+                if image_url:
+                    is_image = True
+            except Exception:
                 pass
 
-        # Build the post dict
-        parsed = {
-            "id": post.get("name", ""),           # fullname like t3_xxxxx
-            "post_id": post.get("id", ""),         # short id
-            "subreddit": subreddit,
-            "title": post.get("title", ""),
-            "author": post.get("author", "[deleted]"),
-            "created_utc": post.get("created_utc", 0),
-            "created_datetime": datetime.fromtimestamp(
-                post.get("created_utc", 0), tz=timezone.utc
-            ).strftime("%Y-%m-%d %H:%M:%S"),
-            "score": post.get("score", 0),
-            "upvote_ratio": post.get("upvote_ratio", 0),
-            "num_comments": post.get("num_comments", 0),
-            "url": url,
-            "permalink": f"https://www.reddit.com{post.get('permalink', '')}",
-            "domain": post.get("domain", ""),
-            "selftext": post.get("selftext", ""),
-            "is_self": post.get("is_self", False),
-            "is_image": is_image,
-            "is_gallery": is_gallery,
-            "image_url": image_url,
-            "gallery_urls": gallery_urls,
-            "thumbnail": thumbnail,
-            "link_flair_text": post.get("link_flair_text", ""),
-            "over_18": post.get("over_18", False),
-        }
-        posts.append(parsed)
-
-    return posts, after_token
+    return is_image, is_gallery, image_url, gallery_urls, thumbnail
 
 
-def scrape_subreddit(subreddit, num_posts, sort="new"):
+# HTTP with backoff
+def fetch_json(session: requests.Session, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
+    for i in range(MAX_RETRIES):
+        try:
+            r = session.get(url, params=params, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+
+            if r.status_code == 429 or (500 <= r.status_code < 600):
+                wait = min(120, (BACKOFF_BASE ** (i + 1)) + random.uniform(0, 1.5))
+                print(f"[WARN] HTTP {r.status_code}. sleep {wait:.1f}s then retry... url={r.url}")
+                time.sleep(wait)
+                continue
+
+            print(f"[WARN] HTTP {r.status_code} for {r.url}")
+            return None
+        except Exception as e:
+            wait = min(60, (BACKOFF_BASE ** (i + 1)) + random.uniform(0, 1.0))
+            print(f"[WARN] request failed ({e}). sleep {wait:.1f}s then retry...")
+            time.sleep(wait)
+    return None
+
+
+# Checkpoint
+def load_checkpoint(path: str) -> Tuple[List[Dict], set, Dict]:
     """
-    Scrape posts from a subreddit using the .json endpoint.
-    
-    Pagination: each request returns up to 100 posts and an 'after' token.
-    We keep requesting until we have enough posts or there are no more.
-    
-    For 5000 posts: 5000 / 100 = 50 requests, at ~1.5s each = ~75 seconds.
-
-    Tries multiple sort methods (hot, new, top, rising) to maximize
-    unique posts. Reddit caps each sort listing at ~1000 posts, so using
-    multiple sorts lets us get more. Posts are deduplicated by post_id.
+    返回 collected, seen_ids, state
+    state: 用于记录每个 source 的 after / counts，便于真正断点续跑
     """
-    seen_ids = set()
-    all_posts = []
+    if not path or not os.path.exists(path):
+        return [], set(), {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    collected = data.get("collected", [])
+    seen = set(data.get("seen", []))
+    state = data.get("state", {})
+    return collected, seen, state
 
-    for sort in SORT_METHODS:
-        if len(all_posts) >= num_posts:
-            break
 
-        base_url = f"https://www.reddit.com/r/{subreddit}/{sort}.json"
-        after = None
-        page = 1
+def save_checkpoint(path: str, collected: List[Dict], seen: set, state: Dict) -> None:
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(
+            {"n": len(collected), "collected": collected, "seen": list(seen), "state": state},
+            f,
+            ensure_ascii=False,
+        )
+    os.replace(tmp, path)
 
-        # For 'top' sort, add timeframe param to get more historical posts
-        extra_params = {}
-        if sort == "top":
-            extra_params["t"] = "all"
 
-        print(f"\n{'='*60}")
-        print(f"Scraping r/{subreddit} | Sort: {sort} | Target: {num_posts} | Have: {len(all_posts)}")
-        print(f"{'='*60}")
-
-        while len(all_posts) < num_posts:
-            params = {"limit": POSTS_PER_REQUEST, **extra_params}
-            if after:
-                params["after"] = after
-
-            print(f"  [Page {page}] Fetching (after={after or 'None'})...")
-            json_data = fetch_json(base_url, params=params)
-
-            if not json_data:
-                print("  Failed to fetch page. Moving to next sort method.")
-                break
-
-            posts, after = parse_posts_from_json(json_data, subreddit)
-
-            if not posts:
-                print(f"  No more posts from sort={sort}. Moving on.")
-                break
-
-            # Deduplicate, only add posts we haven't seen before
-            new_count = 0
-            for p in posts:
-                if p["post_id"] not in seen_ids:
-                    seen_ids.add(p["post_id"])
-                    all_posts.append(p)
-                    new_count += 1
-
-            print(f"  Got {len(posts)} posts, {new_count} new. Total unique: {len(all_posts)}")
-
-            if not after:
-                print(f"  No 'after' token for sort={sort}. End of listing.")
-                break
-
-            page += 1
-            time.sleep(REQUEST_DELAY)
-
-    return all_posts[:num_posts]
-
-def extract_comments(comment_listing, max_comments):
+# Parsing
+def parse_listing(payload: Dict) -> Tuple[List[Dict], Optional[str]]:
     """
-    Extract top-level comments from Reddit's comment JSON structure.
-
-    The detail endpoint returns: [post_listing, comment_listing]
-    comment_listing["data"]["children"] contains t1 (comment) and "more" nodes.
-    We take top-level comments only, sorted by score, and keep top N.
+    标准 listing: /r/{sub}/{sort}.json or /search/.json
+    返回 posts(list of child["data"]) 和 after token
     """
-    comments = []
-
-    if not comment_listing or "data" not in comment_listing:
-        return comments
-
-    for child in comment_listing["data"].get("children", []):
-        if child.get("kind") != "t1":
-            continue
-
-        c = child["data"]
-        body = c.get("body", "")
-
-        # Skip deleted/removed
-        if not body or body in ("[deleted]", "[removed]"):
-            continue
-
-        comments.append({
-            "author": c.get("author", "[deleted]"),
-            "body": body,
-            "score": c.get("score", 0),
-            "created_utc": c.get("created_utc", 0),
-        })
-
-    # Sort by score desc, return top N
-    comments.sort(key=lambda x: x["score"], reverse=True)
-    return comments[:max_comments]
-
-
-def fetch_comments_for_post(post):
-    """
-    Fetch comments for a single post via its detail .json endpoint.
-
-    URL: https://www.reddit.com/r/{sub}/comments/{post_id}.json
-    Returns list of two Listings: [0]=post, [1]=comments
-    """
-    url = f"https://www.reddit.com/r/{post['subreddit']}/comments/{post['post_id']}.json"
-    params = {"sort": "top", "limit": 500}
-
-    json_data = fetch_json(url, params=params)
-
-    if not json_data or not isinstance(json_data, list) or len(json_data) < 2:
-        return []
-
-    # Calculate how many comments to keep - DEPRECATED
-    # total = post.get("num_comments", 0)
-    # num_to_keep = max(COMMENT_MIN, int(total * COMMENT_SAMPLE_RATIO))
-    # num_to_keep = min(num_to_keep, COMMENT_MAX)
-
-    return extract_comments(json_data[1], COMMENT_MAX)
-
-
-def fetch_all_comments(all_posts, output_file):
-    """
-    Second pass, fetch comments for post with most comments.
-    Supports resume: if output_file exists, skips already-enriched posts.
-    Saves progress every COMMENT_SAVE_INTERVAL posts.
-    """
-    # Resume support: check which posts already have comments
-    enriched_ids = set()
     try:
-        with open(output_file, "r", encoding="utf-8") as f:
-            saved_posts = json.load(f)
-            enriched_ids = {p["post_id"] for p in saved_posts if "comments" in p}
-            if enriched_ids:
-                print(f"  Resuming: {len(enriched_ids)} posts already have comments.")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+        children = payload["data"]["children"]
+        after = payload["data"].get("after")
+    except Exception:
+        return [], None
 
-    # Sort all posts by num_comments descending to prioritize high-value targets
-    sorted_indices = sorted(
-        range(len(all_posts)),
-        key=lambda i: all_posts[i].get("num_comments", 0),
-        reverse=True
-    )
-
-    # Count how many are eligible (above threshold and not yet fetched)
-    eligible = [
-        i for i in sorted_indices
-        if all_posts[i].get("num_comments", 0) >= COMMENT_FETCH_THRESHOLD
-        and all_posts[i]["post_id"] not in enriched_ids
-    ]
-    to_fetch = eligible[:COMMENT_REQUEST_BUDGET]
-
-    # Set empty comments/combined_text for ALL posts first
-    for post in all_posts:
-        if "comments" not in post:
-            post["comments"] = []
-            post["comments_fetched"] = 0
-            post["combined_text"] = post.get("title", "") + " " + post.get("selftext", "")
-
-    print(f"\n{'='*60}")
-    print(f"PHASE 2: Fetching comments (smart mode)")
-    print(f"Total posts: {len(all_posts)}")
-    print(f"Eligible (>={COMMENT_FETCH_THRESHOLD} comments): {len(eligible)}")
-    print(f"Request budget: {COMMENT_REQUEST_BUDGET}")
-    print(f"Will fetch: {len(to_fetch)} posts (sorted by most comments first)")
-    print(f"{'='*60}")
-
-    if to_fetch:
-        top_post = all_posts[to_fetch[0]]
-        print(f"  Most commented post: {top_post['title'][:60]}... ({top_post['num_comments']} comments)")
-
-    fetched = 0
-    consecutive_429 = 0
-
-    for idx in to_fetch:
-        post = all_posts[idx]
-
-        print(f"  [{fetched+1}/{len(to_fetch)}] ({post['num_comments']} comments) {post['title'][:50]}...")
-
-        comments = fetch_comments_for_post(post)
-
-        if comments is None:
-            # fetch_json returned None = likely 429 after all retries
-            consecutive_429 += 1
-            print(f"    [WARN] Failed to fetch. Consecutive failures: {consecutive_429}")
-            # If we get 3 consecutive failures, stop
-            if consecutive_429 >= 3:
-                print(f"    [STOP] Too many consecutive failures. Saving progress and stopping.")
-                break
+    out = []
+    for ch in children:
+        if ch.get("kind") != "t3":
             continue
-        else:
-            consecutive_429 = 0  # reset on success
+        d = ch.get("data", {})
+        if not isinstance(d, dict):
+            continue
+        out.append(d)
+    return out, after
 
-        post["comments"] = comments
-        post["comments_fetched"] = len(comments)
 
-        # Build combined_text
-        parts = [post.get("title", "")]
-        if post.get("selftext"):
-            parts.append(post["selftext"])
-        for c in comments:
-            parts.append(c["body"])
-        post["combined_text"] = " ".join(parts)
-
-        print(f"    OK: {len(comments)} comments fetched")
-        fetched += 1
-
-        # Save progress periodically
-        if fetched % COMMENT_SAVE_INTERVAL == 0:
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(all_posts, f, ensure_ascii=False, indent=2)
-            print(f"    [SAVED] Progress: {fetched}/{len(to_fetch)}")
-
-        time.sleep(REQUEST_DELAY)
-
-    # Final save
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(all_posts, f, ensure_ascii=False, indent=2)
-
-    posts_with_comments = sum(1 for p in all_posts if p.get("comments"))
-    total_comments = sum(len(p.get("comments", [])) for p in all_posts)
-    print(f"\n  Comment fetch done: {fetched} posts fetched, "
-          f"{posts_with_comments} have comments, {total_comments} total comments.")
-
-    return all_posts
-
+# Main scraping logic
+def build_sources(subs: List[str], sorts: List[str], use_global: bool) -> List[Tuple[str, str]]:
+    """
+    sources: (sub, sort) + optional ("_global_", "global_search_year")
+    """
+    sources: List[Tuple[str, str]] = []
+    for sub in subs:
+        for srt in sorts:
+            sources.append((sub, srt))
+    if use_global:
+        sources.append(("_global_", "global_search_year"))
+    return sources
 
 
 def main():
-    # Parse command line argument for number of posts
-    total_target = 5000  # default
-    if len(sys.argv) > 1:
-        try:
-            num_posts = int(sys.argv[1])
-        except ValueError:
-            print("Usage: python reddit_scraper.py [total_num_posts]")
-            print("Example: python reddit_scraper.py 5000")
-            sys.exit(1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("N", type=int, help="total posts to fetch (e.g., 5000)")
+    ap.add_argument("--subs", nargs="*", default=DEFAULT_SUBS, help="subreddits (domain you chose)")
+    ap.add_argument("--sorts", nargs="*", default=DEFAULT_SORTS, help="listing sorts to rotate")
+    ap.add_argument("--use_global_search", action="store_true", help="use global search to fill remaining posts")
+    ap.add_argument("--global_query", default=DEFAULT_GLOBAL_QUERY, help="query string for global search")
+    ap.add_argument("--time_range", default="year", choices=["day", "week", "month", "year", "all"], help="t= in reddit")
+    ap.add_argument("--per_source_cap", type=int, default=1000, help="cap per (sub,sort) source")
+    ap.add_argument("--min_text_len", type=int, default=MIN_TEXT_LEN)
+    ap.add_argument("--sleep_min", type=float, default=SLEEP_RANGE[0])
+    ap.add_argument("--sleep_max", type=float, default=SLEEP_RANGE[1])
+    ap.add_argument("--checkpoint", default="ck_scrape.json", help="checkpoint path")
+    ap.add_argument("--out_prefix", default="posts_lab5", help="output prefix for json/jsonl")
+    ap.add_argument("--salt", default="dsci560", help="salt for username masking")
+    args = ap.parse_args()
 
-    per_sub_target = (total_target // len(SUBREDDITS)) + 1
+    target_n = args.N
+    per_source_cap = min(args.per_source_cap, 1000)  # 和 PDF 的 API 阈值一致思路
+    sleep_range = (max(0.0, args.sleep_min), max(args.sleep_min, args.sleep_max))
 
-    print(f"Target: {num_posts} posts per subreddit")
-    print(f"Subreddits: {SUBREDDITS}")
+    collected, seen, state = load_checkpoint(args.checkpoint)
+    print(f"[INFO] resume: already have {len(collected)} posts; checkpoint={args.checkpoint}")
 
-    all_posts = []
-    for sub in SUBREDDITS:
-        # Stop early if we already have enough total posts
-        if len(all_posts) >= total_target:
-            print(f"\nAlready reached {total_target} posts. Skipping r/{sub}.")
-            break
+    # state schema:
+    # state["after"][key_source] = token
+    # state["count"][key_source] = int
+    if "after" not in state:
+        state["after"] = {}
+    if "count" not in state:
+        state["count"] = {}
 
-        remaining = total_target - len(all_posts)
-        target = min(per_sub_target, remaining)
+    subs_set = set(args.subs)
 
-        posts = scrape_subreddit(sub, target)
-        all_posts.extend(posts)
-        print(f"\nr/{sub} done: scraped {len(posts)} posts | Running total: {len(all_posts)}")
+    with requests.Session() as s:
+        s.headers.update({
+            "User-Agent": UA_JSON,
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
-    # Final deduplicate across subreddits
-    seen_ids = set()
-    unique_posts = []
-    for p in all_posts:
-        if p["post_id"] not in seen_ids:
-            seen_ids.add(p["post_id"])
-            unique_posts.append(p)
-    all_posts = unique_posts[:total_target]
+        sources = build_sources(args.subs, args.sorts, args.use_global_search)
+        # init counts
+        for sub, mode in sources:
+            key = f"{sub}:{mode}"
+            state["after"].setdefault(key, None)
+            state["count"].setdefault(key, 0)
 
+        while len(collected) < target_n:
+            progressed = False
 
-    # Summary
-    total_posts = len(all_posts)
-    print(f"\n{'='*60}")
-    print(f"PHASE 1 COMPLETE: Post listing scraped")
-    print(f"Total unique posts: {total_posts}")
-    print(f"{'='*60}")
-    # Save Phase 1 results first
-    output_file = "scraped_posts.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(all_posts, f, ensure_ascii=False, indent=2)
-    print(f"Phase 1 data saved to {output_file}")
+            for sub, mode in sources:
+                if len(collected) >= target_n:
+                    break
 
-    # Phase 2 - Fetch comments for each post
-    all_posts = fetch_all_comments(all_posts, output_file)
+                key_source = f"{sub}:{mode}"
+                if state["count"][key_source] >= per_source_cap:
+                    continue
 
-    # Preview first 5 posts
-    print("\n--- Preview (first 5 posts) ---")
-    for i, post in enumerate(all_posts[:5]):
-        print(f"\n[{i+1}] r/{post['subreddit']} | Score: {post['score']} | Comments: {post['num_comments']}")
-        print(f"    Title: {post['title'][:80]}")
-        print(f"    Author: {post['author']}")
-        print(f"    Date: {post['created_datetime']}")
-        print(f"    Image: {'Yes' if post['is_image'] else 'No'} | Self-post: {'Yes' if post['is_self'] else 'No'}")
-        if post["selftext"]:
-            print(f"    Text: {post['selftext'][:120]}...")
+                after = state["after"][key_source]
 
-    # Count stats
-    image_posts = sum(1 for p in all_posts if p["is_image"] or p["is_gallery"])
-    self_posts = sum(1 for p in all_posts if p["is_self"])
-    link_posts = len(all_posts) - self_posts
-    # Per-subreddit breakdown
-    sub_counts = {}
-    for p in all_posts:
-        sub_counts[p["subreddit"]] = sub_counts.get(p["subreddit"], 0) + 1
+                # build URL/params
+                if mode == "global_search_year":
+                    url = "https://www.reddit.com/search/.json"
+                    params = {
+                        "q": args.global_query,
+                        "sort": "new",
+                        "t": args.time_range,
+                        "limit": POSTS_PER_REQUEST,
+                    }
+                    if after:
+                        params["after"] = after
+                else:
+                    # subreddit listing
+                    url = f"https://www.reddit.com/r/{sub}/{mode}.json"
+                    params = {"limit": POSTS_PER_REQUEST}
+                    if mode == "top":
+                        params["t"] = args.time_range
+                    if after:
+                        params["after"] = after
 
-    print(f"\n--- Stats ---")
-    print(f"Total posts: {total_posts}")
-    print(f"Self-text posts: {self_posts}")
-    print(f"Link posts:      {link_posts}")
-    print(f"Image/gallery posts:     {image_posts}")
-    for sub, count in sub_counts.items():
-        print(f"  r/{sub}: {count}")
+                payload = fetch_json(s, url, params=params)
+                if not payload:
+                    print(f"[WARN] listing fetch failed for {key_source}; cool down 10s...")
+                    time.sleep(10)
+                    continue
 
-    # Comment stats
-    posts_with_comments = sum(1 for p in all_posts if p.get("comments"))
-    total_comments = sum(len(p.get("comments", [])) for p in all_posts)
-    posts_with_text = sum(1 for p in all_posts if p.get("combined_text", "").strip())
-    print(f"Posts with comments:{posts_with_comments}")
-    print(f"Total comments:     {total_comments}")
-    print(f"Posts with any text:{posts_with_text}")
+                batch, after2 = parse_listing(payload)
+                state["after"][key_source] = after2
 
-    # Save to JSON
-    output_file = "scraped_posts.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(all_posts, f, ensure_ascii=False, indent=2)
-    print(f"\nData saved to {output_file}")
+                if not batch:
+                    continue
+
+                # consume batch
+                for d in batch:
+                    if len(collected) >= target_n:
+                        break
+                    if state["count"][key_source] >= per_source_cap:
+                        break
+
+                    # global search 时，确保 topic/domain 仍然合理：只保留你选的 subs（否则会混进奇怪的 94 subs）
+                    real_sub = d.get("subreddit") or sub
+                    if sub == "_global_":
+                        if real_sub not in subs_set:
+                            continue
+
+                    # filter ads / stickied
+                    if is_likely_ad_or_irrelevant(d):
+                        continue
+
+                    fullname = d.get("name")  # t3_xxx
+                    if not fullname or fullname in seen:
+                        continue
+                    seen.add(fullname)
+
+                    title = clean_text(d.get("title", ""))
+                    selftext = clean_text(d.get("selftext", ""))
+                    is_self = bool(d.get("is_self", False))
+
+                    # message abstraction：正文不足就回退到标题（保证有文本可做聚类/关键词）
+                    body = selftext if is_self else ""
+                    final_text = body if len(body) >= args.min_text_len else title
+                    if len(final_text) < args.min_text_len:
+                        continue
+
+                    is_image, is_gallery, image_url, gallery_urls, thumbnail = extract_image_fields(d)
+
+                    author_raw = d.get("author") or "[deleted]"
+                    author_masked = mask_username(author_raw, salt=args.salt)
+
+                    created_utc = d.get("created_utc", 0)
+                    created_iso = to_iso_utc(created_utc)
+
+                    permalink = d.get("permalink") or ""
+                    if permalink and not permalink.startswith("http"):
+                        permalink = "https://www.reddit.com" + permalink
+
+                    out_url = d.get("url") or ""
+
+                    # 输出记录（方便后续入库 MySQL）
+                    rec = {
+                        "fullname": fullname,
+                        "post_id": d.get("id", ""),
+                        "subreddit": real_sub,
+                        "title": title,
+                        "author": author_masked,          # ✅ masked
+                        "author_raw": None,               # 不存原始用户名（隐私）
+                        "created_utc": created_utc,
+                        "created": created_iso,           # ✅ timestamp converted
+                        "permalink": permalink,
+                        "out_url": out_url,
+                        "domain": d.get("domain", ""),
+                        "score": d.get("score", 0),
+                        "num_comments": d.get("num_comments", 0),
+                        "is_self": is_self,
+                        "body": body,
+                        "final_text": final_text,
+                        "is_image": bool(is_image),
+                        "is_gallery": bool(is_gallery),
+                        "image_url": image_url,
+                        "gallery_urls": gallery_urls,
+                        "thumbnail": thumbnail,
+                        "over_18": bool(d.get("over_18", False)),
+                        "link_flair_text": d.get("link_flair_text", "") or "",
+                        # 预留：OCR/keywords/topics
+                        "ocr_text": "",
+                        "keywords": [],
+                        "topic": "",
+                    }
+
+                    collected.append(rec)
+                    state["count"][key_source] += 1
+                    progressed = True
+
+                    if len(collected) % 50 == 0:
+                        save_checkpoint(args.checkpoint, collected, seen, state)
+                        print(f"[INFO] checkpoint saved: n={len(collected)}")
+
+                    time.sleep(random.uniform(*sleep_range))
+
+                print(f"[INFO] {key_source}: +{state['count'][key_source]} / cap={per_source_cap} | total={len(collected)}/{target_n}")
+                time.sleep(random.uniform(*sleep_range))
+
+            if not progressed:
+                print("[WARN] no progress in this round; sleep 10s then retry...")
+                save_checkpoint(args.checkpoint, collected, seen, state)
+                time.sleep(10)
+
+    # write outputs
+    out_jsonl = f"{args.out_prefix}_{len(collected)}.jsonl"
+    out_json = f"{args.out_prefix}_{len(collected)}.json"
+
+    with open(out_jsonl, "w", encoding="utf-8") as f:
+        for rec in collected:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(collected, f, ensure_ascii=False, indent=2)
+
+    save_checkpoint(args.checkpoint, collected, seen, state)
+
+    print(f"\n[DONE] wrote {len(collected)} posts")
+    print(f" - {out_jsonl}")
+    print(f" - {out_json}")
+    print("\n[SAMPLE] first 3 posts:")
+    for p in collected[:3]:
+        print("-", p["subreddit"], "|", p["title"][:60], "| is_image=", p["is_image"], "| created=", p.get("created"))
 
 
 if __name__ == "__main__":
-    start = time.time()
     main()
-    print(f"\nTotal execution time: {time.time() - start:.2f} seconds")
