@@ -29,12 +29,6 @@ def _safe_text(x) -> str:
 
 
 def basic_clean(text: str) -> str:
-    """
-    Light cleaning for clustering stage (scraper already cleaned a lot).
-    - remove urls
-    - collapse whitespace
-    - remove some non-text symbols
-    """
     text = _safe_text(text)
     text = re.sub(r"http[s]?://\S+", " ", text)
     text = re.sub(r"www\.\S+", " ", text)
@@ -63,9 +57,6 @@ def build_corpus(posts: List[Dict], text_field: str = "combined_text") -> List[s
 
 
 def fit_vectorizer(corpus: List[str], max_features: int = 5000) -> Tuple[TfidfVectorizer, np.ndarray]:
-    """
-    Returns (vectorizer, X_sparse)
-    """
     vectorizer = TfidfVectorizer(
         stop_words=STOP_WORDS,
         max_features=max_features,
@@ -83,19 +74,14 @@ def fit_kmeans(X, k: int = 8, random_state: int = 42) -> KMeans:
 
 
 def top_keywords_for_cluster(vectorizer: TfidfVectorizer, center_vec, top_n: int = 10) -> List[str]:
-    """
-    center_vec: 1D array for a cluster center in TF-IDF space
-    """
+
     feature_names = vectorizer.get_feature_names_out()
     top_idx = np.argsort(center_vec)[::-1][:top_n]
     return [feature_names[i] for i in top_idx if center_vec[i] > 0]
 
 
 def representative_post_index(X, center_vec) -> int:
-    """
-    Find post closest to centroid in Euclidean distance (on dense TF-IDF vectors).
-    For speed, we convert only once outside if needed; here we accept dense matrix.
-    """
+
     # X: dense (n, d)
     diffs = X - center_vec
     dists = np.linalg.norm(diffs, axis=1)
@@ -103,9 +89,6 @@ def representative_post_index(X, center_vec) -> int:
 
 
 def visualize_pca(X, labels, out_png: str = DEFAULT_PLOT_PNG) -> None:
-    """
-    Save PCA scatter plot to out_png
-    """
     pca = PCA(n_components=2, random_state=42)
     reduced = pca.fit_transform(X)
 
