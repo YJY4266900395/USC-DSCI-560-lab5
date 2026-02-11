@@ -5,8 +5,8 @@ import sys
 from datetime import datetime, timezone
 
 # ============ CONFIG ============
-SUBREDDITS = ["tech", "cybersecurity", "technology", "artificial", "datascience", "computerscience"]
-SORT_METHODS = ["hot", "new", "top", "rising"]  # Bypass post limitation of .json endpoints by using different sort methods
+SUBREDDITS = ["tech", "cybersecurity", "technology", "programming", "datascience", "computerscience"]
+SORT_METHODS = ["new", "hot", "top", "rising"]  # Bypass post limitation of .json endpoints by using different sort methods
 POSTS_PER_REQUEST = 100  # Reddit max per request
 
 # Use a descriptive User-Agent (Reddit recommends this for .json endpoints)
@@ -15,9 +15,18 @@ HEADERS = {
 }
 
 # Rate limiting config
-REQUEST_DELAY = 1.5      # seconds between requests (be polite)
-MAX_RETRIES = 5
+REQUEST_DELAY = 1.8      # seconds between requests (be polite)
+MAX_RETRIES = 4
 BACKOFF_FACTOR = 2        # exponential backoff multiplier
+
+# Comment fetching config
+# COMMENT_SAMPLE_RATIO = 0.10   # keep top 10% of comments per post
+# COMMENT_MIN = 1               # at least 1 comment (if any exist)
+COMMENT_MAX = 500              # cap per post to avoid huge payloads
+COMMENT_SAVE_INTERVAL = 50    # save progress every N posts during comment fetch
+COMMENT_FETCH_THRESHOLD = 5   # skip getting comment for posts with comments fewer than this
+COMMENT_REQUEST_BUDGET = 500  # max number of comment requests to make total
+RATE_LIMIT_COOLDOWN = 120     # seconds to wait after hitting a 429 before resuming
 
 
 def fetch_json(url, params=None, retries=0):
@@ -249,6 +258,172 @@ def scrape_subreddit(subreddit, num_posts, sort="new"):
 
     return all_posts[:num_posts]
 
+def extract_comments(comment_listing, max_comments):
+    """
+    Extract top-level comments from Reddit's comment JSON structure.
+
+    The detail endpoint returns: [post_listing, comment_listing]
+    comment_listing["data"]["children"] contains t1 (comment) and "more" nodes.
+    We take top-level comments only, sorted by score, and keep top N.
+    """
+    comments = []
+
+    if not comment_listing or "data" not in comment_listing:
+        return comments
+
+    for child in comment_listing["data"].get("children", []):
+        if child.get("kind") != "t1":
+            continue
+
+        c = child["data"]
+        body = c.get("body", "")
+
+        # Skip deleted/removed
+        if not body or body in ("[deleted]", "[removed]"):
+            continue
+
+        comments.append({
+            "author": c.get("author", "[deleted]"),
+            "body": body,
+            "score": c.get("score", 0),
+            "created_utc": c.get("created_utc", 0),
+        })
+
+    # Sort by score desc, return top N
+    comments.sort(key=lambda x: x["score"], reverse=True)
+    return comments[:max_comments]
+
+
+def fetch_comments_for_post(post):
+    """
+    Fetch comments for a single post via its detail .json endpoint.
+
+    URL: https://www.reddit.com/r/{sub}/comments/{post_id}.json
+    Returns list of two Listings: [0]=post, [1]=comments
+    """
+    url = f"https://www.reddit.com/r/{post['subreddit']}/comments/{post['post_id']}.json"
+    params = {"sort": "top", "limit": 500}
+
+    json_data = fetch_json(url, params=params)
+
+    if not json_data or not isinstance(json_data, list) or len(json_data) < 2:
+        return []
+
+    # Calculate how many comments to keep - DEPRECATED
+    # total = post.get("num_comments", 0)
+    # num_to_keep = max(COMMENT_MIN, int(total * COMMENT_SAMPLE_RATIO))
+    # num_to_keep = min(num_to_keep, COMMENT_MAX)
+
+    return extract_comments(json_data[1], COMMENT_MAX)
+
+
+def fetch_all_comments(all_posts, output_file):
+    """
+    Second pass, fetch comments for post with most comments.
+    Supports resume: if output_file exists, skips already-enriched posts.
+    Saves progress every COMMENT_SAVE_INTERVAL posts.
+    """
+    # Resume support: check which posts already have comments
+    enriched_ids = set()
+    try:
+        with open(output_file, "r", encoding="utf-8") as f:
+            saved_posts = json.load(f)
+            enriched_ids = {p["post_id"] for p in saved_posts if "comments" in p}
+            if enriched_ids:
+                print(f"  Resuming: {len(enriched_ids)} posts already have comments.")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    # Sort all posts by num_comments descending to prioritize high-value targets
+    sorted_indices = sorted(
+        range(len(all_posts)),
+        key=lambda i: all_posts[i].get("num_comments", 0),
+        reverse=True
+    )
+
+    # Count how many are eligible (above threshold and not yet fetched)
+    eligible = [
+        i for i in sorted_indices
+        if all_posts[i].get("num_comments", 0) >= COMMENT_FETCH_THRESHOLD
+        and all_posts[i]["post_id"] not in enriched_ids
+    ]
+    to_fetch = eligible[:COMMENT_REQUEST_BUDGET]
+
+    # Set empty comments/combined_text for ALL posts first
+    for post in all_posts:
+        if "comments" not in post:
+            post["comments"] = []
+            post["comments_fetched"] = 0
+            post["combined_text"] = post.get("title", "") + " " + post.get("selftext", "")
+
+    print(f"\n{'='*60}")
+    print(f"PHASE 2: Fetching comments (smart mode)")
+    print(f"Total posts: {len(all_posts)}")
+    print(f"Eligible (>={COMMENT_FETCH_THRESHOLD} comments): {len(eligible)}")
+    print(f"Request budget: {COMMENT_REQUEST_BUDGET}")
+    print(f"Will fetch: {len(to_fetch)} posts (sorted by most comments first)")
+    print(f"{'='*60}")
+
+    if to_fetch:
+        top_post = all_posts[to_fetch[0]]
+        print(f"  Most commented post: {top_post['title'][:60]}... ({top_post['num_comments']} comments)")
+
+    fetched = 0
+    consecutive_429 = 0
+
+    for idx in to_fetch:
+        post = all_posts[idx]
+
+        print(f"  [{fetched+1}/{len(to_fetch)}] ({post['num_comments']} comments) {post['title'][:50]}...")
+
+        comments = fetch_comments_for_post(post)
+
+        if comments is None:
+            # fetch_json returned None = likely 429 after all retries
+            consecutive_429 += 1
+            print(f"    [WARN] Failed to fetch. Consecutive failures: {consecutive_429}")
+            # If we get 3 consecutive failures, stop
+            if consecutive_429 >= 3:
+                print(f"    [STOP] Too many consecutive failures. Saving progress and stopping.")
+                break
+            continue
+        else:
+            consecutive_429 = 0  # reset on success
+
+        post["comments"] = comments
+        post["comments_fetched"] = len(comments)
+
+        # Build combined_text
+        parts = [post.get("title", "")]
+        if post.get("selftext"):
+            parts.append(post["selftext"])
+        for c in comments:
+            parts.append(c["body"])
+        post["combined_text"] = " ".join(parts)
+
+        print(f"    OK: {len(comments)} comments fetched")
+        fetched += 1
+
+        # Save progress periodically
+        if fetched % COMMENT_SAVE_INTERVAL == 0:
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(all_posts, f, ensure_ascii=False, indent=2)
+            print(f"    [SAVED] Progress: {fetched}/{len(to_fetch)}")
+
+        time.sleep(REQUEST_DELAY)
+
+    # Final save
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(all_posts, f, ensure_ascii=False, indent=2)
+
+    posts_with_comments = sum(1 for p in all_posts if p.get("comments"))
+    total_comments = sum(len(p.get("comments", [])) for p in all_posts)
+    print(f"\n  Comment fetch done: {fetched} posts fetched, "
+          f"{posts_with_comments} have comments, {total_comments} total comments.")
+
+    return all_posts
+
+
 
 def main():
     # Parse command line argument for number of posts
@@ -291,10 +466,19 @@ def main():
 
 
     # Summary
+    total_posts = len(all_posts)
     print(f"\n{'='*60}")
-    print(f"SCRAPING COMPLETE")
-    print(f"Total unique posts: {len(all_posts)}")
+    print(f"PHASE 1 COMPLETE: Post listing scraped")
+    print(f"Total unique posts: {total_posts}")
     print(f"{'='*60}")
+    # Save Phase 1 results first
+    output_file = "scraped_posts.json"
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(all_posts, f, ensure_ascii=False, indent=2)
+    print(f"Phase 1 data saved to {output_file}")
+
+    # Phase 2 - Fetch comments for each post
+    all_posts = fetch_all_comments(all_posts, output_file)
 
     # Preview first 5 posts
     print("\n--- Preview (first 5 posts) ---")
@@ -317,11 +501,20 @@ def main():
         sub_counts[p["subreddit"]] = sub_counts.get(p["subreddit"], 0) + 1
 
     print(f"\n--- Stats ---")
+    print(f"Total posts: {total_posts}")
     print(f"Self-text posts: {self_posts}")
     print(f"Link posts:      {link_posts}")
     print(f"Image/gallery posts:     {image_posts}")
     for sub, count in sub_counts.items():
         print(f"  r/{sub}: {count}")
+
+    # Comment stats
+    posts_with_comments = sum(1 for p in all_posts if p.get("comments"))
+    total_comments = sum(len(p.get("comments", [])) for p in all_posts)
+    posts_with_text = sum(1 for p in all_posts if p.get("combined_text", "").strip())
+    print(f"Posts with comments:{posts_with_comments}")
+    print(f"Total comments:     {total_comments}")
+    print(f"Posts with any text:{posts_with_text}")
 
     # Save to JSON
     output_file = "scraped_posts.json"
