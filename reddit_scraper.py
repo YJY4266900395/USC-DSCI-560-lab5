@@ -5,7 +5,8 @@ import sys
 from datetime import datetime, timezone
 
 # ============ CONFIG ============
-SUBREDDITS = ["tech", "cybersecurity"]
+SUBREDDITS = ["tech", "cybersecurity", "technology", "artificial", "datascience", "computerscience"]
+SORT_METHODS = ["hot", "new", "top", "rising"]  # Bypass post limitation of .json endpoints by using different sort methods
 POSTS_PER_REQUEST = 100  # Reddit max per request
 
 # Use a descriptive User-Agent (Reddit recommends this for .json endpoints)
@@ -117,6 +118,18 @@ def parse_posts_from_json(json_data, subreddit):
         # Check for gallery posts (multiple images)
         is_gallery = post.get("is_gallery", False)
 
+        # Extract gallery image URLs for multi-image posts.
+        # Gallery posts store image metadata in 'media_metadata' field.
+        gallery_urls = []
+        if is_gallery and "media_metadata" in post:
+            for media_id, media_info in post["media_metadata"].items():
+                if media_info.get("status") == "valid" and "s" in media_info:
+                    img_u = media_info["s"].get("u", "")
+                    if img_u:
+                        gallery_urls.append(img_u.replace("&amp;", "&"))
+            if gallery_urls:
+                is_image = True
+
         # Get thumbnail URL
         thumbnail = post.get("thumbnail", "")
         if thumbnail in ("self", "default", "nsfw", "spoiler", ""):
@@ -156,6 +169,7 @@ def parse_posts_from_json(json_data, subreddit):
             "is_image": is_image,
             "is_gallery": is_gallery,
             "image_url": image_url,
+            "gallery_urls": gallery_urls,
             "thumbnail": thumbnail,
             "link_flair_text": post.get("link_flair_text", ""),
             "over_18": post.get("over_18", False),
@@ -173,77 +187,113 @@ def scrape_subreddit(subreddit, num_posts, sort="new"):
     We keep requesting until we have enough posts or there are no more.
     
     For 5000 posts: 5000 / 100 = 50 requests, at ~1.5s each = ~75 seconds.
-    Much faster than your teammate's 'hours' estimate!
+
+    Tries multiple sort methods (hot, new, top, rising) to maximize
+    unique posts. Reddit caps each sort listing at ~1000 posts, so using
+    multiple sorts lets us get more. Posts are deduplicated by post_id.
     """
+    seen_ids = set()
     all_posts = []
-    base_url = f"https://www.reddit.com/r/{subreddit}/{sort}.json"
-    after = None
-    page = 1
 
-    print(f"\n{'='*60}")
-    print(f"Scraping r/{subreddit} | Target: {num_posts} posts | Sort: {sort}")
-    print(f"{'='*60}")
-
-    while len(all_posts) < num_posts:
-        params = {"limit": POSTS_PER_REQUEST}
-        if after:
-            params["after"] = after
-
-        remaining = num_posts - len(all_posts)
-        if remaining < POSTS_PER_REQUEST:
-            params["limit"] = remaining
-
-        print(f"\n[Page {page}] Fetching (after={after or 'None'})...")
-        json_data = fetch_json(base_url, params=params)
-
-        if not json_data:
-            print("  Failed to fetch page. Stopping.")
+    for sort in SORT_METHODS:
+        if len(all_posts) >= num_posts:
             break
 
-        posts, after = parse_posts_from_json(json_data, subreddit)
+        base_url = f"https://www.reddit.com/r/{subreddit}/{sort}.json"
+        after = None
+        page = 1
 
-        if not posts:
-            print("  No more posts returned. Reached the end.")
-            break
+        # For 'top' sort, add timeframe param to get more historical posts
+        extra_params = {}
+        if sort == "top":
+            extra_params["t"] = "all"
 
-        all_posts.extend(posts)
-        print(f"  Got {len(posts)} posts. Total so far: {len(all_posts)}")
+        print(f"\n{'='*60}")
+        print(f"Scraping r/{subreddit} | Sort: {sort} | Target: {num_posts} | Have: {len(all_posts)}")
+        print(f"{'='*60}")
 
-        if not after:
-            print("  No 'after' token. Reached the last page.")
-            break
+        while len(all_posts) < num_posts:
+            params = {"limit": POSTS_PER_REQUEST, **extra_params}
+            if after:
+                params["after"] = after
 
-        page += 1
-        time.sleep(REQUEST_DELAY)
+            print(f"  [Page {page}] Fetching (after={after or 'None'})...")
+            json_data = fetch_json(base_url, params=params)
 
-    # Trim to exact requested count
+            if not json_data:
+                print("  Failed to fetch page. Moving to next sort method.")
+                break
+
+            posts, after = parse_posts_from_json(json_data, subreddit)
+
+            if not posts:
+                print(f"  No more posts from sort={sort}. Moving on.")
+                break
+
+            # Deduplicate, only add posts we haven't seen before
+            new_count = 0
+            for p in posts:
+                if p["post_id"] not in seen_ids:
+                    seen_ids.add(p["post_id"])
+                    all_posts.append(p)
+                    new_count += 1
+
+            print(f"  Got {len(posts)} posts, {new_count} new. Total unique: {len(all_posts)}")
+
+            if not after:
+                print(f"  No 'after' token for sort={sort}. End of listing.")
+                break
+
+            page += 1
+            time.sleep(REQUEST_DELAY)
+
     return all_posts[:num_posts]
 
 
 def main():
     # Parse command line argument for number of posts
-    num_posts = 50  # default
+    total_target = 5000  # default
     if len(sys.argv) > 1:
         try:
             num_posts = int(sys.argv[1])
         except ValueError:
-            print("Usage: python reddit_scraper.py [number_of_posts]")
-            print("Example: python reddit_scraper.py 500")
+            print("Usage: python reddit_scraper.py [total_num_posts]")
+            print("Example: python reddit_scraper.py 5000")
             sys.exit(1)
+
+    per_sub_target = (total_target // len(SUBREDDITS)) + 1
 
     print(f"Target: {num_posts} posts per subreddit")
     print(f"Subreddits: {SUBREDDITS}")
 
     all_posts = []
     for sub in SUBREDDITS:
-        posts = scrape_subreddit(sub, num_posts)
+        # Stop early if we already have enough total posts
+        if len(all_posts) >= total_target:
+            print(f"\nAlready reached {total_target} posts. Skipping r/{sub}.")
+            break
+
+        remaining = total_target - len(all_posts)
+        target = min(per_sub_target, remaining)
+
+        posts = scrape_subreddit(sub, target)
         all_posts.extend(posts)
-        print(f"\nr/{sub} done: scraped {len(posts)} posts")
+        print(f"\nr/{sub} done: scraped {len(posts)} posts | Running total: {len(all_posts)}")
+
+    # Final deduplicate across subreddits
+    seen_ids = set()
+    unique_posts = []
+    for p in all_posts:
+        if p["post_id"] not in seen_ids:
+            seen_ids.add(p["post_id"])
+            unique_posts.append(p)
+    all_posts = unique_posts[:total_target]
+
 
     # Summary
     print(f"\n{'='*60}")
     print(f"SCRAPING COMPLETE")
-    print(f"Total posts: {len(all_posts)}")
+    print(f"Total unique posts: {len(all_posts)}")
     print(f"{'='*60}")
 
     # Preview first 5 posts
@@ -261,10 +311,17 @@ def main():
     image_posts = sum(1 for p in all_posts if p["is_image"] or p["is_gallery"])
     self_posts = sum(1 for p in all_posts if p["is_self"])
     link_posts = len(all_posts) - self_posts
+    # Per-subreddit breakdown
+    sub_counts = {}
+    for p in all_posts:
+        sub_counts[p["subreddit"]] = sub_counts.get(p["subreddit"], 0) + 1
+
     print(f"\n--- Stats ---")
     print(f"Self-text posts: {self_posts}")
     print(f"Link posts:      {link_posts}")
-    print(f"Image posts:     {image_posts}")
+    print(f"Image/gallery posts:     {image_posts}")
+    for sub, count in sub_counts.items():
+        print(f"  r/{sub}: {count}")
 
     # Save to JSON
     output_file = "scraped_posts.json"
