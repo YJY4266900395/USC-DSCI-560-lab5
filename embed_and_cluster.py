@@ -3,18 +3,22 @@ import json
 import os
 from collections import Counter
 from datetime import datetime
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import PCA
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# sentence-transformers is recommended for semantic embeddings
 from sentence_transformers import SentenceTransformer
 
+# DB deps (used only when --write_db is enabled)
+import mysql.connector
 
+
+# I/O helpers
 def load_records(path: str):
     if path.endswith(".jsonl"):
         records = []
@@ -31,25 +35,28 @@ def load_records(path: str):
         raise ValueError("Input must be .json or .jsonl")
 
 
-def safe_get(rec, key, default=""):
+def safe_get(rec: dict, key: str, default: str = ""):
     v = rec.get(key, default)
     return v if v is not None else default
 
 
-def compute_embeddings(texts, model_name="all-MiniLM-L6-v2", batch_size=64):
+# Embeddings + clustering
+def compute_embeddings(texts: List[str], model_name: str = "all-MiniLM-L6-v2", batch_size: int = 64) -> np.ndarray:
     model = SentenceTransformer(model_name)
     emb = model.encode(
         texts,
         batch_size=batch_size,
         show_progress_bar=True,
-        normalize_embeddings=True,  # makes cosine similarity = dot product
+        normalize_embeddings=True,  # cosine sim becomes dot product
     )
     return np.asarray(emb, dtype=np.float32)
 
 
-def top_keywords_per_cluster(texts, labels, top_n=10, max_features=20000):
+def top_keywords_per_cluster(
+    texts: List[str], labels: np.ndarray, top_n: int = 10, max_features: int = 20000
+) -> Dict[int, List[str]]:
     """
-    Use TF-IDF on final_text and aggregate within each cluster.
+    TF-IDF over merged text; compute mean tf-idf per cluster and take top terms.
     """
     vectorizer = TfidfVectorizer(
         stop_words="english",
@@ -60,45 +67,50 @@ def top_keywords_per_cluster(texts, labels, top_n=10, max_features=20000):
     X = vectorizer.fit_transform(texts)
     terms = np.array(vectorizer.get_feature_names_out())
 
-    cluster_keywords = {}
-    for c in sorted(set(labels)):
+    cluster_keywords: Dict[int, List[str]] = {}
+    for c in sorted(set(labels.tolist())):
         idx = np.where(labels == c)[0]
         if len(idx) == 0:
-            cluster_keywords[c] = []
+            cluster_keywords[int(c)] = []
             continue
-        # mean tf-idf score across docs in cluster
         mean_scores = X[idx].mean(axis=0).A1
         top_idx = mean_scores.argsort()[::-1][:top_n]
-        cluster_keywords[c] = terms[top_idx].tolist()
+        cluster_keywords[int(c)] = terms[top_idx].tolist()
 
     return cluster_keywords
 
 
-def representative_posts(embeddings, labels, centroids, records, per_cluster=3):
+def representative_posts(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    centroids: np.ndarray,
+    records: List[dict],
+    per_cluster: int = 3,
+) -> Dict[int, List[dict]]:
     """
-    Find posts closest to centroid (cosine distance since embeddings normalized).
-    For normalized embeddings, cosine similarity = dot(emb, centroid_normed).
-    We'll compute cosine distance = 1 - similarity.
+    Pick posts closest to centroid by cosine similarity (embeddings are normalized).
     """
-    reps = {}
-    # normalize centroids too
+    reps: Dict[int, List[dict]] = {}
     c_norm = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-12)
 
-    for c in sorted(set(labels)):
+    for c in sorted(set(labels.tolist())):
         idx = np.where(labels == c)[0]
         if len(idx) == 0:
-            reps[c] = []
+            reps[int(c)] = []
             continue
+
         E = embeddings[idx]
-        sim = E @ c_norm[c]  # cosine similarity
+        sim = E @ c_norm[int(c)]
         order = np.argsort(-sim)[:per_cluster]
         chosen = idx[order]
 
         out = []
         for i in chosen:
-            r = records[i]
+            r = records[int(i)]
+            preview = (safe_get(r, "final_text") + " " + safe_get(r, "ocr_text")).strip()[:220]
             out.append(
                 {
+                    "fullname": safe_get(r, "fullname"),
                     "subreddit": safe_get(r, "subreddit"),
                     "title": safe_get(r, "title"),
                     "permalink": safe_get(r, "permalink"),
@@ -107,23 +119,23 @@ def representative_posts(embeddings, labels, centroids, records, per_cluster=3):
                     "score": r.get("score", 0),
                     "num_comments": r.get("num_comments", 0),
                     "created": safe_get(r, "created"),
-                    "final_text_preview": safe_get(r, "final_text")[:220],
+                    "final_text_preview": preview,
                     "cosine_similarity_to_centroid": float(sim[np.where(chosen == i)[0][0]]),
                 }
             )
-        reps[c] = out
+        reps[int(c)] = out
+
     return reps
 
 
-def maybe_plot(embeddings, labels, outpath="clusters_plot.png", max_points=5000):
+def maybe_plot(embeddings: np.ndarray, labels: np.ndarray, outpath: str = "clusters_plot.png", max_points: int = 5000):
     """
-    Simple PCA 2D plot.
+    Simple PCA 2D plot of (a subset of) points.
     """
     import matplotlib.pyplot as plt
 
     n = embeddings.shape[0]
     if n > max_points:
-        # subsample for readability
         rng = np.random.default_rng(42)
         idx = rng.choice(n, size=max_points, replace=False)
         E = embeddings[idx]
@@ -145,9 +157,83 @@ def maybe_plot(embeddings, labels, outpath="clusters_plot.png", max_points=5000)
     plt.close()
 
 
+# Topic labeling
+def build_topic_labels(cluster_keywords: Dict[int, List[str]], top_m: int = 3) -> Dict[int, str]:
+    """
+    Turn each cluster's top keywords into a short human-readable topic string.
+    """
+    labels: Dict[int, str] = {}
+    for c, kws in cluster_keywords.items():
+        kws = kws or []
+        topic = ", ".join([k for k in kws[:top_m] if isinstance(k, str) and k.strip()]) if kws else f"cluster_{c}"
+        labels[int(c)] = topic if topic else f"cluster_{c}"
+    return labels
+
+
+# DB writeback
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "lab5")
+DB_PASS = os.getenv("DB_PASS", "lab5pass")
+DB_NAME = os.getenv("DB_NAME", "dsci560_lab5")
+
+
+def ensure_db_columns(cur, table: str):
+    """
+    Add cluster_id/topic columns if missing (idempotent).
+    """
+    cur.execute(f"SHOW COLUMNS FROM `{table}`;")
+    existing = {row[0] for row in cur.fetchall()}
+
+    if "cluster_id" not in existing:
+        cur.execute(f"ALTER TABLE `{table}` ADD COLUMN `cluster_id` INT NULL;")
+    if "topic" not in existing:
+        cur.execute(f"ALTER TABLE `{table}` ADD COLUMN `topic` VARCHAR(255) NULL;")
+
+
+def write_back_to_db(df: pd.DataFrame, table: str):
+    """
+    Write cluster_id/topic back to MySQL keyed by fullname.
+    """
+    needed = {"fullname", "cluster_id", "topic"}
+    if not needed.issubset(set(df.columns)):
+        raise ValueError(f"DataFrame must contain columns: {sorted(list(needed))}")
+
+    df2 = df.copy()
+    df2["fullname"] = df2["fullname"].astype(str)
+    df2 = df2[df2["fullname"].notna() & (df2["fullname"].str.strip() != "")]
+
+    conn = mysql.connector.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME
+    )
+    cur = conn.cursor()
+
+    ensure_db_columns(cur, table)
+    conn.commit()
+
+    sql = f"""
+    UPDATE `{table}`
+    SET cluster_id = %s,
+        topic = %s
+    WHERE fullname = %s
+    """
+
+    updated = 0
+    for _, row in df2[["cluster_id", "topic", "fullname"]].iterrows():
+        cur.execute(sql, (int(row["cluster_id"]), str(row["topic"]), str(row["fullname"])))
+        updated += 1
+        if updated % 500 == 0:
+            conn.commit()
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"[DONE] DB writeback complete: updated {updated} rows in {DB_NAME}.{table}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Path to posts_lab5_5000.json or .jsonl")
+    ap.add_argument("--input", required=True, help="Path to posts_*.json or .jsonl (from fetch_reddit.py)")
     ap.add_argument("--k", type=int, default=8, help="Number of clusters (KMeans)")
     ap.add_argument("--model", default="all-MiniLM-L6-v2", help="SentenceTransformer model name")
     ap.add_argument("--batch_size", type=int, default=64)
@@ -155,41 +241,43 @@ def main():
     ap.add_argument("--rep_posts", type=int, default=3)
     ap.add_argument("--out_dir", default="outputs")
     ap.add_argument("--plot", action="store_true", help="Generate PCA plot (clusters_plot.png)")
-    args = ap.parse_args()
 
+    ap.add_argument("--topic_top_m", type=int, default=3, help="How many keywords to use for a topic label")
+    ap.add_argument("--write_db", action="store_true", help="Write cluster_id/topic back into MySQL")
+    ap.add_argument("--table", default="reddit_posts", help="MySQL table name (default: reddit_posts)")
+
+    args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
     records = load_records(args.input)
 
-    # Use final_text as primary text for semantic embedding
-    texts = [safe_get(r, "final_text") for r in records]
-    # Guard: drop empty
+    texts = [(safe_get(r, "final_text") + " " + safe_get(r, "ocr_text")).strip() for r in records]
+
     keep = [i for i, t in enumerate(texts) if isinstance(t, str) and t.strip()]
     records = [records[i] for i in keep]
     texts = [texts[i] for i in keep]
 
-    print(f"[INFO] Loaded {len(records)} records with non-empty final_text")
+    print(f"[INFO] Loaded {len(records)} records with non-empty (final_text + ocr_text)")
 
-    # Embeddings
     embeddings = compute_embeddings(texts, model_name=args.model, batch_size=args.batch_size)
     print(f"[INFO] Embeddings shape: {embeddings.shape}")
 
-    # KMeans clustering
     kmeans = KMeans(n_clusters=args.k, random_state=42, n_init="auto")
-    labels = kmeans.fit_predict(embeddings)
+    labels = kmeans.fit_predict(embeddings).astype(int)
     centroids = kmeans.cluster_centers_
-    print("[INFO] Cluster sizes:", dict(Counter(labels)))
+    print("[INFO] Cluster sizes:", dict(Counter(labels.tolist())))
 
-    # --- NEW: save centroids + meta for query mode ---
+    # Save centroids + meta for query mode
     centroids_path = os.path.join(args.out_dir, "centroids.npy")
     np.save(centroids_path, centroids.astype(np.float32))
 
     meta = {
         "model": args.model,
         "k": int(args.k),
-        "normalized_embeddings": True,  # because normalize_embeddings=True
+        "normalized_embeddings": True,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "input_file": os.path.basename(args.input),
+        "text_fields_used": ["final_text", "ocr_text"],
     }
     meta_path = os.path.join(args.out_dir, "meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -197,12 +285,10 @@ def main():
 
     print(f"[DONE] Wrote {centroids_path}")
     print(f"[DONE] Wrote {meta_path}")
-    # --- END NEW ---
 
-    # Keywords per cluster (TF-IDF on final_text)
-    keywords = top_keywords_per_cluster(texts, labels, top_n=args.top_keywords)
+    cluster_keywords = top_keywords_per_cluster(texts, labels, top_n=args.top_keywords)
+    topic_labels = build_topic_labels(cluster_keywords, top_m=args.topic_top_m)
 
-    # Representative posts per cluster
     reps = representative_posts(
         embeddings=embeddings,
         labels=labels,
@@ -211,22 +297,27 @@ def main():
         per_cluster=args.rep_posts,
     )
 
-    # Write per-post CSV for easy inspection / DB insertion
+    # Per-post CSV (includes cluster_id + topic)
     df = pd.DataFrame(records)
     df["cluster_id"] = labels
+    df["topic"] = [topic_labels[int(c)] for c in labels]
+
+    if "fullname" in df.columns:
+        df = df[df["fullname"].notna()]
+
     csv_path = os.path.join(args.out_dir, "clusters_posts.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8")
     print(f"[DONE] Wrote {csv_path}")
 
-    # Write summary JSON
     summary = []
-    for c in sorted(set(labels)):
+    for c in sorted(set(labels.tolist())):
         summary.append(
             {
                 "cluster_id": int(c),
+                "topic": topic_labels.get(int(c), f"cluster_{int(c)}"),
                 "size": int((labels == c).sum()),
-                "top_keywords": keywords.get(c, []),
-                "representative_posts": reps.get(c, []),
+                "top_keywords": cluster_keywords.get(int(c), []),
+                "representative_posts": reps.get(int(c), []),
             }
         )
 
@@ -235,11 +326,25 @@ def main():
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(f"[DONE] Wrote {summary_path}")
 
-    # Optional plot
+    # Save PCA 2D coords + labels + fullnames for query-time highlighting
+    pca = PCA(n_components=2, random_state=42)
+    X2 = pca.fit_transform(embeddings)
+    np.save(os.path.join(args.out_dir, "pca_2d.npy"), X2.astype(np.float32))
+    np.save(os.path.join(args.out_dir, "labels.npy"), labels.astype(np.int32))
+    fullnames = [safe_get(r, "fullname") for r in records]
+    with open(os.path.join(args.out_dir, "fullnames.json"), "w", encoding="utf-8") as f:
+        json.dump(fullnames, f, ensure_ascii=False, indent=2)
+    print(f"[DONE] Wrote {os.path.join(args.out_dir, 'pca_2d.npy')}")
+    print(f"[DONE] Wrote {os.path.join(args.out_dir, 'labels.npy')}")
+    print(f"[DONE] Wrote {os.path.join(args.out_dir, 'fullnames.json')}")
+
     if args.plot:
         plot_path = os.path.join(args.out_dir, "clusters_plot.png")
         maybe_plot(embeddings, labels, outpath=plot_path)
         print(f"[DONE] Wrote {plot_path}")
+
+    if args.write_db:
+        write_back_to_db(df=df, table=args.table)
 
 
 if __name__ == "__main__":
