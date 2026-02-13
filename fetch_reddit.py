@@ -9,14 +9,15 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from io import BytesIO  # used to wrap image bytes for OCR processing
 
 # Defaults / Config
 UA_JSON = "DSCI560-Lab5-Scraper/2.0 (Educational Project; JSON endpoints; +your_email@example.com)"
 DEFAULT_SUBS = ["tech", "cybersecurity", "technology", "artificial", "datascience", "computerscience"]
-DEFAULT_SORTS = ["new", "hot", "top", "rising"]  # 多 sort 绕开单 listing ~1000 限制
+DEFAULT_SORTS = ["new", "hot", "top", "rising"]  # rotating sorts helps bypass ~1000 listing cap
 DEFAULT_GLOBAL_QUERY = "cyber OR security OR malware OR ransomware OR vulnerability"
 
-POSTS_PER_REQUEST = 100  # reddit max
+POSTS_PER_REQUEST = 100  # Reddit listing API maximum
 MIN_TEXT_LEN = 30
 
 SLEEP_RANGE = (1.0, 2.0)
@@ -26,20 +27,26 @@ BACKOFF_BASE = 2
 
 # Utilities
 def clean_text(s: str) -> str:
-    """最小但够用的清洗：去HTML、零宽、合并空白、去奇怪控制符。"""
+    """
+    Minimal but sufficient text cleaning:
+    - remove HTML tags
+    - remove zero-width characters
+    - collapse whitespace
+    - strip control characters
+    """
     if not s:
         return ""
     s = s.replace("\u200b", " ")
-    # 去 HTML tag（JSON selftext 通常没tag，但保险）
     s = re.sub(r"<[^>]+>", " ", s)
-    # 去一些控制字符
     s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def mask_username(author: str, salt: str = "dsci560") -> str:
-    """把用户名 mask/pseudonymize。"""
+    """
+    Pseudonymize usernames using SHA256 hashing.
+    """
     if not author:
         author = "unknown"
     h = hashlib.sha256((salt + ":" + author).encode("utf-8")).hexdigest()
@@ -47,25 +54,31 @@ def mask_username(author: str, salt: str = "dsci560") -> str:
 
 
 def to_iso_utc(ts_utc: Optional[float]) -> Optional[str]:
+    """
+    Convert Unix timestamp (UTC) to ISO8601 string.
+    """
     if not ts_utc:
         return None
     return datetime.fromtimestamp(ts_utc, tz=timezone.utc).isoformat()
 
 
 def is_likely_ad_or_irrelevant(post: Dict) -> bool:
-    # promoted / stickied 广告与置顶
+    """
+    Filter out promoted or stickied posts.
+    """
     if post.get("stickied"):
         return True
     if post.get("promoted"):
         return True
-    # 有些广告/推荐会有 weird domain/empty author 等，这里不做过度猜测
     return False
 
 
 def extract_image_fields(d: Dict) -> Tuple[bool, bool, str, List[str], str]:
     """
-    返回:
-      is_image, is_gallery, image_url, gallery_urls, thumbnail
+    Extract image-related metadata from a Reddit post.
+
+    Returns:
+        is_image, is_gallery, image_url, gallery_urls, thumbnail
     """
     url = d.get("url") or ""
     url_l = url.lower()
@@ -93,7 +106,7 @@ def extract_image_fields(d: Dict) -> Tuple[bool, bool, str, List[str], str]:
     if is_image:
         image_url = url
     else:
-        # preview 里有时也能拿到图
+        # sometimes preview contains usable image
         pv = d.get("preview", {})
         if isinstance(pv, dict) and isinstance(pv.get("images"), list) and pv["images"]:
             try:
@@ -106,7 +119,101 @@ def extract_image_fields(d: Dict) -> Tuple[bool, bool, str, List[str], str]:
     return is_image, is_gallery, image_url, gallery_urls, thumbnail
 
 
-# HTTP with backoff
+# OCR (Fast two-stage scan)
+def _maybe_import_ocr():
+    """
+    OCR is optional. We import dependencies only if --ocr is enabled,
+    so the script still runs without Tesseract installed.
+    """
+    try:
+        import pytesseract  # type: ignore
+        from PIL import Image, ImageFilter, ImageOps  # type: ignore
+        return pytesseract, Image, ImageFilter, ImageOps
+    except Exception as e:
+        raise RuntimeError(
+            "OCR is enabled but dependencies are missing. Install: "
+            "`sudo apt-get install -y tesseract-ocr` and `pip install pytesseract pillow`."
+        ) from e
+
+
+def _basic_ocr_preprocess(img, *, image_filter_mod, image_ops_mod):
+    """
+    Cheap preprocessing to improve OCR accuracy without blowing up runtime:
+      - grayscale
+      - autocontrast
+      - 2x upscale (helps small text a lot)
+      - light median denoise
+      - simple thresholding
+    """
+    gray = img.convert("L")
+    gray = image_ops_mod.autocontrast(gray)
+    gray = gray.resize((gray.width * 2, gray.height * 2))
+    gray = gray.filter(image_filter_mod.MedianFilter(size=3))
+    # A simple global threshold. Works surprisingly well for screenshots/memes.
+    gray = gray.point(lambda x: 255 if x > 180 else 0)
+    return gray
+
+
+def ocr_maybe_text(
+    session: requests.Session,
+    url: str,
+    *,
+    pytesseract_mod,
+    pil_image_mod,
+    image_filter_mod,
+    image_ops_mod,
+    timeout: int = 15,
+    max_bytes: int = 5_000_000,
+    quick_box: int = 400,
+    min_chars: int = 8,
+    min_alnum: int = 4,
+) -> str:
+    """
+    Two-stage OCR:
+      1) Run a quick scan on a small thumbnail to detect potential text.
+      2) If text seems likely, run full OCR on the original image (with light preprocessing).
+
+    Returns empty string on failure to keep pipeline robust.
+    """
+    if not url:
+        return ""
+    try:
+        r = session.get(url, timeout=timeout)
+        if r.status_code != 200:
+            return ""
+
+        # Skip non-image responses (e.g., HTML pages)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if ctype and ("image/" not in ctype):
+            return ""
+
+        if len(r.content) > max_bytes:
+            return ""
+
+        img = pil_image_mod.open(BytesIO(r.content)).convert("RGB")
+
+        # Stage 1: quick thumbnail scan (cheap)
+        small = img.copy()
+        small.thumbnail((quick_box, quick_box))
+        small_pp = _basic_ocr_preprocess(small, image_filter_mod=image_filter_mod, image_ops_mod=image_ops_mod)
+
+        quick_cfg = "--oem 1 --psm 6 -l eng"
+        quick = clean_text(pytesseract_mod.image_to_string(small_pp, config=quick_cfg))
+
+        alnum = sum(ch.isalnum() for ch in quick)
+        if len(quick) < min_chars or alnum < min_alnum:
+            return ""
+
+        # Stage 2: full OCR (still pretty fast, but much more accurate)
+        full_pp = _basic_ocr_preprocess(img, image_filter_mod=image_filter_mod, image_ops_mod=image_ops_mod)
+        full_cfg = "--oem 1 --psm 6 -l eng"
+        full = clean_text(pytesseract_mod.image_to_string(full_pp, config=full_cfg))
+        return full
+    except Exception:
+        return ""
+
+
+# HTTP with exponential backoff
 def fetch_json(session: requests.Session, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
     for i in range(MAX_RETRIES):
         try:
@@ -116,7 +223,7 @@ def fetch_json(session: requests.Session, url: str, params: Optional[Dict] = Non
 
             if r.status_code == 429 or (500 <= r.status_code < 600):
                 wait = min(120, (BACKOFF_BASE ** (i + 1)) + random.uniform(0, 1.5))
-                print(f"[WARN] HTTP {r.status_code}. sleep {wait:.1f}s then retry... url={r.url}")
+                print(f"[WARN] HTTP {r.status_code}. sleeping {wait:.1f}s before retry... url={r.url}")
                 time.sleep(wait)
                 continue
 
@@ -124,16 +231,18 @@ def fetch_json(session: requests.Session, url: str, params: Optional[Dict] = Non
             return None
         except Exception as e:
             wait = min(60, (BACKOFF_BASE ** (i + 1)) + random.uniform(0, 1.0))
-            print(f"[WARN] request failed ({e}). sleep {wait:.1f}s then retry...")
+            print(f"[WARN] request failed ({e}). sleeping {wait:.1f}s before retry...")
             time.sleep(wait)
     return None
 
 
-# Checkpoint
+# Checkpoint handling
 def load_checkpoint(path: str) -> Tuple[List[Dict], set, Dict]:
     """
-    返回 collected, seen_ids, state
-    state: 用于记录每个 source 的 after / counts，便于真正断点续跑
+    Load previous scraping state:
+    - collected records
+    - seen post IDs
+    - pagination state per source
     """
     if not path or not os.path.exists(path):
         return [], set(), {}
@@ -146,6 +255,9 @@ def load_checkpoint(path: str) -> Tuple[List[Dict], set, Dict]:
 
 
 def save_checkpoint(path: str, collected: List[Dict], seen: set, state: Dict) -> None:
+    """
+    Save progress safely (write temp file then replace).
+    """
     if not path:
         return
     tmp = path + ".tmp"
@@ -158,11 +270,12 @@ def save_checkpoint(path: str, collected: List[Dict], seen: set, state: Dict) ->
     os.replace(tmp, path)
 
 
-# Parsing
+# Parse Reddit listing response
 def parse_listing(payload: Dict) -> Tuple[List[Dict], Optional[str]]:
     """
-    标准 listing: /r/{sub}/{sort}.json or /search/.json
-    返回 posts(list of child["data"]) 和 after token
+    Parse standard Reddit listing JSON and return:
+      - list of post data dictionaries
+      - next "after" token
     """
     try:
         children = payload["data"]["children"]
@@ -181,10 +294,12 @@ def parse_listing(payload: Dict) -> Tuple[List[Dict], Optional[str]]:
     return out, after
 
 
-# Main scraping logic
+# Build list of (subreddit, sort) sources
 def build_sources(subs: List[str], sorts: List[str], use_global: bool) -> List[Tuple[str, str]]:
     """
-    sources: (sub, sort) + optional ("_global_", "global_search_year")
+    Generate scraping sources:
+      (subreddit, sort) pairs,
+      plus optional global search source.
     """
     sources: List[Tuple[str, str]] = []
     for sub in subs:
@@ -202,7 +317,12 @@ def main():
     ap.add_argument("--sorts", nargs="*", default=DEFAULT_SORTS, help="listing sorts to rotate")
     ap.add_argument("--use_global_search", action="store_true", help="use global search to fill remaining posts")
     ap.add_argument("--global_query", default=DEFAULT_GLOBAL_QUERY, help="query string for global search")
-    ap.add_argument("--time_range", default="year", choices=["day", "week", "month", "year", "all"], help="t= in reddit")
+    ap.add_argument(
+        "--time_range",
+        default="year",
+        choices=["day", "week", "month", "year", "all"],
+        help="time filter for Reddit listings",
+    )
     ap.add_argument("--per_source_cap", type=int, default=1000, help="cap per (sub,sort) source")
     ap.add_argument("--min_text_len", type=int, default=MIN_TEXT_LEN)
     ap.add_argument("--sleep_min", type=float, default=SLEEP_RANGE[0])
@@ -210,18 +330,28 @@ def main():
     ap.add_argument("--checkpoint", default="ck_scrape.json", help="checkpoint path")
     ap.add_argument("--out_prefix", default="posts_lab5", help="output prefix for json/jsonl")
     ap.add_argument("--salt", default="dsci560", help="salt for username masking")
+
+    # OCR configuration (fast two-stage mode)
+    ap.add_argument("--ocr", action="store_true", help="Enable OCR for image posts")
+    ap.add_argument("--tesseract_cmd", default="", help="Optional path to tesseract binary")
+    ap.add_argument("--ocr_timeout", type=int, default=15, help="Image download timeout (seconds)")
+    ap.add_argument("--ocr_max_bytes", type=int, default=5_000_000, help="Maximum allowed image size in bytes")
+    ap.add_argument("--ocr_quick_box", type=int, default=400, help="Thumbnail size for quick OCR scan")
+    ap.add_argument("--ocr_min_chars", type=int, default=8, help="Minimum characters threshold in quick scan")
+    ap.add_argument("--ocr_min_alnum", type=int, default=4, help="Minimum alphanumeric characters threshold")
+    ap.add_argument("--ocr_max_images_per_post", type=int, default=3, help="Maximum images to OCR per post")
+    ap.add_argument("--ocr_budget_images", type=int, default=200, help="Maximum total images to OCR")
+
     args = ap.parse_args()
 
     target_n = args.N
-    per_source_cap = min(args.per_source_cap, 1000)  # 和 PDF 的 API 阈值一致思路
+    per_source_cap = min(args.per_source_cap, 1000)  # aligned with Reddit listing API limit
     sleep_range = (max(0.0, args.sleep_min), max(args.sleep_min, args.sleep_max))
 
     collected, seen, state = load_checkpoint(args.checkpoint)
     print(f"[INFO] resume: already have {len(collected)} posts; checkpoint={args.checkpoint}")
 
-    # state schema:
-    # state["after"][key_source] = token
-    # state["count"][key_source] = int
+    # Initialize pagination tracking structure if missing
     if "after" not in state:
         state["after"] = {}
     if "count" not in state:
@@ -229,14 +359,34 @@ def main():
 
     subs_set = set(args.subs)
 
+    # Initialize OCR dependencies only if enabled
+    pytesseract_mod = None
+    pil_image_mod = None
+    image_filter_mod = None
+    image_ops_mod = None
+    ocr_images_used = 0
+    if args.ocr:
+        pytesseract_mod, pil_image_mod, image_filter_mod, image_ops_mod = _maybe_import_ocr()
+        if args.tesseract_cmd:
+            pytesseract_mod.pytesseract.tesseract_cmd = args.tesseract_cmd
+        print(
+            "[INFO] OCR enabled (fast two-stage): "
+            f"quick_box={args.ocr_quick_box}, "
+            f"budget_images={args.ocr_budget_images}, "
+            f"max_images_per_post={args.ocr_max_images_per_post}"
+        )
+
     with requests.Session() as s:
-        s.headers.update({
-            "User-Agent": UA_JSON,
-            "Accept-Language": "en-US,en;q=0.9",
-        })
+        s.headers.update(
+            {
+                "User-Agent": UA_JSON,
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
 
         sources = build_sources(args.subs, args.sorts, args.use_global_search)
-        # init counts
+
+        # Initialize source-specific counters and pagination tokens
         for sub, mode in sources:
             key = f"{sub}:{mode}"
             state["after"].setdefault(key, None)
@@ -255,7 +405,7 @@ def main():
 
                 after = state["after"][key_source]
 
-                # build URL/params
+                # Construct URL and parameters for listing endpoint
                 if mode == "global_search_year":
                     url = "https://www.reddit.com/search/.json"
                     params = {
@@ -267,7 +417,6 @@ def main():
                     if after:
                         params["after"] = after
                 else:
-                    # subreddit listing
                     url = f"https://www.reddit.com/r/{sub}/{mode}.json"
                     params = {"limit": POSTS_PER_REQUEST}
                     if mode == "top":
@@ -277,7 +426,7 @@ def main():
 
                 payload = fetch_json(s, url, params=params)
                 if not payload:
-                    print(f"[WARN] listing fetch failed for {key_source}; cool down 10s...")
+                    print(f"[WARN] listing fetch failed for {key_source}; cooling down 10s...")
                     time.sleep(10)
                     continue
 
@@ -287,24 +436,21 @@ def main():
                 if not batch:
                     continue
 
-                # consume batch
                 for d in batch:
                     if len(collected) >= target_n:
                         break
                     if state["count"][key_source] >= per_source_cap:
                         break
 
-                    # global search 时，确保 topic/domain 仍然合理：只保留你选的 subs（否则会混进奇怪的 94 subs）
+                    # If using global search, restrict to selected subreddits only
                     real_sub = d.get("subreddit") or sub
-                    if sub == "_global_":
-                        if real_sub not in subs_set:
-                            continue
+                    if sub == "_global_" and real_sub not in subs_set:
+                        continue
 
-                    # filter ads / stickied
                     if is_likely_ad_or_irrelevant(d):
                         continue
 
-                    fullname = d.get("name")  # t3_xxx
+                    fullname = d.get("name")
                     if not fullname or fullname in seen:
                         continue
                     seen.add(fullname)
@@ -313,7 +459,7 @@ def main():
                     selftext = clean_text(d.get("selftext", ""))
                     is_self = bool(d.get("is_self", False))
 
-                    # message abstraction：正文不足就回退到标题（保证有文本可做聚类/关键词）
+                    # If body text is too short, fall back to title
                     body = selftext if is_self else ""
                     final_text = body if len(body) >= args.min_text_len else title
                     if len(final_text) < args.min_text_len:
@@ -333,16 +479,51 @@ def main():
 
                     out_url = d.get("url") or ""
 
-                    # 输出记录（方便后续入库 MySQL）
+                    # Fast two-stage OCR (only applied to image posts)
+                    ocr_text = ""
+                    if args.ocr and is_image and (ocr_images_used < args.ocr_budget_images):
+                        urls_to_ocr: List[str] = []
+                        if image_url:
+                            urls_to_ocr.append(image_url)
+                        if gallery_urls:
+                            remain = max(0, args.ocr_max_images_per_post - len(urls_to_ocr))
+                            urls_to_ocr.extend(gallery_urls[:remain])
+                        urls_to_ocr = urls_to_ocr[: args.ocr_max_images_per_post]
+
+                        texts: List[str] = []
+                        for u in urls_to_ocr:
+                            if ocr_images_used >= args.ocr_budget_images:
+                                break
+                            t = ocr_maybe_text(
+                                s,
+                                u,
+                                pytesseract_mod=pytesseract_mod,
+                                pil_image_mod=pil_image_mod,
+                                image_filter_mod=image_filter_mod,
+                                image_ops_mod=image_ops_mod,
+                                timeout=args.ocr_timeout,
+                                max_bytes=args.ocr_max_bytes,
+                                quick_box=args.ocr_quick_box,
+                                min_chars=args.ocr_min_chars,
+                                min_alnum=args.ocr_min_alnum,
+                            )
+                            ocr_images_used += 1
+                            if t:
+                                texts.append(t)
+
+                        if texts:
+                            ocr_text = " ".join(texts)
+
+                    # Construct record for storage / downstream processing
                     rec = {
                         "fullname": fullname,
                         "post_id": d.get("id", ""),
                         "subreddit": real_sub,
                         "title": title,
-                        "author": author_masked,          # ✅ masked
-                        "author_raw": None,               # 不存原始用户名（隐私）
+                        "author": author_masked,
+                        "author_raw": None,
                         "created_utc": created_utc,
-                        "created": created_iso,           # ✅ timestamp converted
+                        "created": created_iso,
                         "permalink": permalink,
                         "out_url": out_url,
                         "domain": d.get("domain", ""),
@@ -358,8 +539,7 @@ def main():
                         "thumbnail": thumbnail,
                         "over_18": bool(d.get("over_18", False)),
                         "link_flair_text": d.get("link_flair_text", "") or "",
-                        # 预留：OCR/keywords/topics
-                        "ocr_text": "",
+                        "ocr_text": ocr_text,
                         "keywords": [],
                         "topic": "",
                     }
@@ -370,19 +550,22 @@ def main():
 
                     if len(collected) % 50 == 0:
                         save_checkpoint(args.checkpoint, collected, seen, state)
-                        print(f"[INFO] checkpoint saved: n={len(collected)}")
+                        print(f"[INFO] checkpoint saved: n={len(collected)} (ocr_images_used={ocr_images_used})")
 
                     time.sleep(random.uniform(*sleep_range))
 
-                print(f"[INFO] {key_source}: +{state['count'][key_source]} / cap={per_source_cap} | total={len(collected)}/{target_n}")
+                print(
+                    f"[INFO] {key_source}: +{state['count'][key_source]} / cap={per_source_cap} | "
+                    f"total={len(collected)}/{target_n}"
+                )
                 time.sleep(random.uniform(*sleep_range))
 
             if not progressed:
-                print("[WARN] no progress in this round; sleep 10s then retry...")
+                print("[WARN] no progress in this round; sleeping 10s before retry...")
                 save_checkpoint(args.checkpoint, collected, seen, state)
                 time.sleep(10)
 
-    # write outputs
+    # Write final outputs
     out_jsonl = f"{args.out_prefix}_{len(collected)}.jsonl"
     out_json = f"{args.out_prefix}_{len(collected)}.json"
 
@@ -398,6 +581,7 @@ def main():
     print(f"\n[DONE] wrote {len(collected)} posts")
     print(f" - {out_jsonl}")
     print(f" - {out_json}")
+    print(f"[INFO] OCR images processed total: {ocr_images_used}")
     print("\n[SAMPLE] first 3 posts:")
     for p in collected[:3]:
         print("-", p["subreddit"], "|", p["title"][:60], "| is_image=", p["is_image"], "| created=", p.get("created"))
