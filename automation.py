@@ -3,6 +3,7 @@ import os
 import subprocess
 import time
 from datetime import datetime
+from typing import List
 
 
 def now_str() -> str:
@@ -17,7 +18,7 @@ def log(msg: str):
     print(f"[{now_str()}] {msg}", flush=True)
 
 
-def run_cmd(cmd: list[str], desc: str) -> bool:
+def run_cmd(cmd: List[str], desc: str) -> bool:
     log(f"{desc} ...")
     try:
         r = subprocess.run(cmd, check=True)
@@ -52,10 +53,18 @@ def main():
     ap.add_argument("--sleep_max", type=float, default=1.6, help="Scraper sleep_max")
     ap.add_argument("--plot", action="store_true", help="Generate PCA plot (clusters_plot.png)")
 
-    # ✅ DB loader (auto ingest)
+    # DB loader (auto ingest)
     ap.add_argument("--loader", default="load_jsonl_to_mysql.py", help="Loader script filename")
     ap.add_argument("--table", default="reddit_posts", help="MySQL table name for ingestion")
     ap.add_argument("--no_db", action="store_true", help="Disable DB ingestion step")
+
+    # OCR passthrough — keeps automation aligned with fetch_reddit.py OCR feature
+    ap.add_argument("--ocr", action="store_true", help="Enable OCR in the scraper step")
+    ap.add_argument("--tesseract_cmd", default="", help="Optional path to tesseract binary, e.g. /usr/bin/tesseract")
+    ap.add_argument("--ocr_timeout", type=int, default=15, help="OCR image download timeout (sec)")
+    ap.add_argument("--ocr_max_bytes", type=int, default=5_000_000, help="Max bytes per image download")
+    ap.add_argument("--ocr_max_images_per_post", type=int, default=3, help="Max images to OCR per post")
+    ap.add_argument("--ocr_budget_images", type=int, default=200, help="Max total images to OCR per cycle")
 
     args = ap.parse_args()
 
@@ -65,7 +74,9 @@ def main():
     cycle = 0
     log(
         f"Automation started (FULL AUTO). interval={args.interval_min} min, "
-        f"fetch_n={args.fetch_n}, k={args.k}, db_ingest={'OFF' if args.no_db else 'ON'}"
+        f"fetch_n={args.fetch_n}, k={args.k}, "
+        f"db_ingest={'OFF' if args.no_db else 'ON'}, "
+        f"ocr={'ON' if args.ocr else 'OFF'}"
     )
 
     while True:
@@ -83,16 +94,27 @@ def main():
         log(f"=== Cycle {cycle} start ===")
 
         # 1) Scrape
-        ok1 = run_cmd(
-            [
-                "python3", args.scraper, str(args.fetch_n),
-                "--checkpoint", ck,
-                "--out_prefix", prefix,
-                "--sleep_min", str(args.sleep_min),
-                "--sleep_max", str(args.sleep_max),
-            ],
-            desc=f"Scraping latest posts (N={args.fetch_n})"
-        )
+        cmd1 = [
+            "python3", args.scraper, str(args.fetch_n),
+            "--checkpoint", ck,
+            "--out_prefix", prefix,
+            "--sleep_min", str(args.sleep_min),
+            "--sleep_max", str(args.sleep_max),
+        ]
+
+        # Pass OCR flags through to fetch_reddit.py if enabled
+        if args.ocr:
+            cmd1 += [
+                "--ocr",
+                "--ocr_timeout", str(args.ocr_timeout),
+                "--ocr_max_bytes", str(args.ocr_max_bytes),
+                "--ocr_max_images_per_post", str(args.ocr_max_images_per_post),
+                "--ocr_budget_images", str(args.ocr_budget_images),
+            ]
+            if args.tesseract_cmd:
+                cmd1 += ["--tesseract_cmd", args.tesseract_cmd]
+
+        ok1 = run_cmd(cmd1, desc=f"Scraping latest posts (N={args.fetch_n})")
 
         if not ok1:
             log("[WARN] Scrape failed; skipping the rest of this cycle.")
@@ -108,7 +130,7 @@ def main():
                 log(f"[INFO] Using scraped file: {scraped_json}")
                 log(f"[INFO] Using scraped jsonl for DB: {scraped_jsonl}")
 
-                # 2) (NEW) Ingest into MySQL
+                # 2) Ingest into MySQL
                 if args.no_db:
                     log("[INFO] DB ingestion disabled (--no_db).")
                     ok_db = True
@@ -129,8 +151,13 @@ def main():
                     "--k", str(args.k),
                     "--out_dir", args.out_dir,
                 ]
+
                 if args.plot:
                     cmd2.append("--plot")
+
+                # Only write back to DB if DB ingestion is enabled
+                if not args.no_db:
+                    cmd2 += ["--write_db", "--table", args.table]
 
                 ok2 = run_cmd(cmd2, desc=f"Embedding + clustering (k={args.k})")
 
